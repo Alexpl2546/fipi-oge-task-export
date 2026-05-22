@@ -1,20 +1,31 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import json
 import math
+import mimetypes
+import re
+import shutil
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
+from html import unescape
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urljoin, urlparse
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter, quote_sheetname
 from PIL import Image as PILImage
+
+try:
+    from lxml import html as lxml_html
+except ImportError:  # pragma: no cover
+    lxml_html = None
 
 try:
     from tqdm import tqdm
@@ -38,18 +49,65 @@ class ExportStats:
     cards_created: int = 0
     images_embedded: int = 0
     images_linked: int = 0
+    rendered_png_created: int = 0
+    rendered_fallbacks: int = 0
+    render_resources_found: int = 0
+    render_resources_matched: int = 0
+    render_resources_unmatched: int = 0
+    render_failed_requests: int = 0
+    render_unloaded_images: int = 0
     images_skipped: int = 0
     accessible_images: int = 0
     errors: list[dict[str, str]] = field(default_factory=list)
 
 
-def load_tasks(path: Path, limit: int | None) -> list[dict[str, Any]]:
+@dataclass
+class ResourceMatch:
+    source: str
+    kind: str
+    local_path: str | None = None
+    status: str = "unmatched"
+    reason: str = ""
+
+
+@dataclass
+class RenderHtmlResult:
+    raw_html: str
+    prepared_html: str
+    resources: list[ResourceMatch] = field(default_factory=list)
+    console_messages: list[str] = field(default_factory=list)
+    page_errors: list[str] = field(default_factory=list)
+    failed_requests: list[str] = field(default_factory=list)
+    unloaded_images: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def matched_count(self) -> int:
+        return sum(1 for item in self.resources if item.status == "matched")
+
+    @property
+    def unmatched_count(self) -> int:
+        return sum(1 for item in self.resources if item.status != "matched")
+
+
+def parse_qid_filter(raw_qids: str | None, qid_file: str | None) -> set[str] | None:
+    qids: list[str] = []
+    if raw_qids:
+        qids.extend(item.strip() for item in raw_qids.split(",") if item.strip())
+    if qid_file:
+        qids.extend(item.strip() for item in Path(qid_file).read_text(encoding="utf-8").splitlines() if item.strip())
+    return set(qids) if qids else None
+
+
+def load_tasks(path: Path, limit: int | None, qid_filter: set[str] | None = None) -> list[dict[str, Any]]:
     tasks: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as file:
         for line_number, line in enumerate(file, start=1):
             if not line.strip():
                 continue
             task = json.loads(line)
+            if qid_filter is not None and str(task.get("qid", "")) not in qid_filter:
+                continue
             task["_line_number"] = line_number
             tasks.append(task)
             if limit and len(tasks) >= limit:
@@ -105,6 +163,403 @@ def resolve_path(raw_path: str, data_path: Path) -> Path | None:
         if item.exists():
             return item.resolve()
     return None
+
+
+def rendered_dir_from_args(args: argparse.Namespace, data_path: Path) -> Path:
+    if args.render_dir:
+        return Path(args.render_dir)
+    return data_path.parent / "rendered_tasks"
+
+
+def render_debug_dir_from_args(args: argparse.Namespace, data_path: Path) -> Path:
+    return Path(args.render_debug_dir) if args.render_debug_dir else data_path.parent / "render_debug"
+
+
+def image_uri(path: Path) -> str:
+    mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def replacement_image_html(local_path: Path | None, fallback_src: str, alt: str = "") -> str:
+    src = image_uri(local_path) if local_path is not None else fallback_src
+    return f'<img src="{src}" alt="{alt}" class="inline-image">'
+
+
+def normalize_resource_ref(value: str) -> str:
+    value = unescape(unquote(str(value or "").strip().strip("\"'")))
+    parsed = urlparse(value)
+    path = parsed.path if parsed.scheme else value
+    path = path.replace("\\", "/")
+    while path.startswith("../"):
+        path = path[3:]
+    return path.lstrip("./").lower()
+
+
+def resource_basename(value: str) -> str:
+    return Path(urlparse(normalize_resource_ref(value)).path).name.lower()
+
+
+def resource_stem(value: str) -> str:
+    return Path(resource_basename(value)).stem.lower()
+
+
+def looks_like_image_ref(value: str) -> bool:
+    normalized = normalize_resource_ref(value)
+    basename = resource_basename(normalized)
+    return bool(
+        re.search(r"\.(?:png|jpe?g|gif|webp|bmp|svg)(?:$|\?)", normalized, flags=re.IGNORECASE)
+        or "docs/" in normalized
+        or "questions/" in normalized
+        or basename.startswith("innerimg")
+    )
+
+
+def string_args(js_args: str) -> list[str]:
+    return [unescape(match.group(2)) for match in re.finditer(r"""(["'])(.*?)(?<!\\)\1""", js_args, flags=re.DOTALL)]
+
+
+def extract_document_write_html(raw_html: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        args = string_args(match.group(1))
+        fragments = [item for item in args if "<img" in item.lower()]
+        return unescape("".join(fragments)) if fragments else match.group(0)
+
+    return re.sub(r"document\.write\s*\((.*?)\)\s*;?", replace, raw_html, flags=re.IGNORECASE | re.DOTALL)
+
+
+def extract_js_image_calls(raw_html: str) -> list[str]:
+    refs: list[str] = []
+    for match in re.finditer(r"\bshowpictureq?\s*\((.*?)\)", raw_html, flags=re.IGNORECASE | re.DOTALL):
+        refs.extend(item for item in string_args(match.group(1)) if looks_like_image_ref(item))
+    return refs
+
+
+def extract_css_background_images(raw_html: str) -> list[str]:
+    refs = []
+    for match in re.finditer(r"background(?:-image)?\s*:\s*url\(([^)]+)\)", raw_html, flags=re.IGNORECASE):
+        ref = match.group(1).strip().strip("\"'")
+        if looks_like_image_ref(ref):
+            refs.append(ref)
+    return refs
+
+
+def extract_img_sources(raw_html: str) -> list[str]:
+    if lxml_html is None:
+        return [
+            unescape(src)
+            for src in re.findall(r"<img\b[^>]*\bsrc\s*=\s*['\"]([^'\"]+)['\"]", raw_html, flags=re.IGNORECASE)
+            if src
+        ]
+    try:
+        fragment = lxml_html.fromstring(f"<div>{raw_html}</div>")
+    except Exception:
+        return [
+            unescape(src)
+            for src in re.findall(r"<img\b[^>]*\bsrc\s*=\s*['\"]([^'\"]+)['\"]", raw_html, flags=re.IGNORECASE)
+            if src
+        ]
+    return [unescape(src) for src in fragment.xpath(".//img/@src") if src]
+
+
+def ordered_unique(values: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        key = normalize_resource_ref(value)
+        if key not in seen:
+            seen.add(key)
+            result.append(value)
+    return result
+
+
+def extract_render_resources(raw_html: str) -> list[ResourceMatch]:
+    expanded = extract_document_write_html(raw_html)
+    refs = ordered_unique(
+        extract_js_image_calls(expanded) + extract_img_sources(expanded) + extract_css_background_images(expanded)
+    )
+    return [ResourceMatch(source=ref, kind="image") for ref in refs]
+
+
+def resource_keys(value: str, source_url: str | None = None) -> set[str]:
+    values = {value}
+    if source_url:
+        values.add(urljoin(source_url, value))
+    keys: set[str] = set()
+    for item in values:
+        normalized = normalize_resource_ref(item)
+        basename = resource_basename(item)
+        stem = resource_stem(item)
+        for key in (normalized, basename, stem):
+            if key:
+                keys.add(key)
+    return keys
+
+
+def build_local_image_index(task: dict[str, Any], data_path: Path) -> tuple[dict[str, Path], list[Path]]:
+    index: dict[str, Path] = {}
+    ordered_paths: list[Path] = []
+    source_url = str(task.get("source_url") or SOURCE_URL)
+    refs = [str(item) for item in (task.get("image_refs") or [])]
+    locals_ = [str(item) for item in (task.get("local_images") or [])]
+    for raw_local in locals_:
+        local_path = resolve_path(raw_local, data_path)
+        if local_path is None:
+            continue
+        ordered_paths.append(local_path)
+        for key in resource_keys(raw_local) | {local_path.name.lower(), local_path.stem.lower()}:
+            if key:
+                index[key] = local_path
+    for ref, raw_local in zip(refs, locals_):
+        local_path = resolve_path(raw_local, data_path)
+        if local_path is None:
+            continue
+        for key in resource_keys(ref, source_url):
+            if key:
+                index[key] = local_path
+    for idx, local_path in enumerate(ordered_paths):
+        index[f"{str(task.get('qid', '')).lower()}:{idx}"] = local_path
+    images_dir = data_path.parent / "images"
+    if images_dir.exists():
+        for local_path in images_dir.iterdir():
+            if local_path.is_file():
+                index.setdefault(local_path.name.lower(), local_path)
+                index.setdefault(local_path.stem.lower(), local_path)
+    return index, ordered_paths
+
+
+def match_resources(task: dict[str, Any], data_path: Path, resources: list[ResourceMatch]) -> None:
+    image_index, ordered_paths = build_local_image_index(task, data_path)
+    for idx, resource in enumerate(resources):
+        keys = resource_keys(resource.source, str(task.get("source_url") or SOURCE_URL))
+        local_path = next((image_index[key] for key in keys if key in image_index), None)
+        if local_path is None:
+            local_path = image_index.get(f"{str(task.get('qid', '')).lower()}:{idx}")
+        if local_path is None and idx < len(ordered_paths):
+            local_path = ordered_paths[idx]
+            resource.reason = "matched_by_order"
+        if local_path is not None:
+            resource.local_path = str(local_path)
+            resource.status = "matched"
+        else:
+            resource.status = "unmatched"
+            resource.reason = "no local image match"
+
+
+def find_resource_for_ref(ref: str, resources: list[ResourceMatch]) -> ResourceMatch | None:
+    ref_keys = resource_keys(ref, SOURCE_URL)
+    for resource in resources:
+        if ref_keys & resource_keys(resource.source, SOURCE_URL):
+            return resource
+    return None
+
+
+def replace_js_image_calls(raw_html: str, resources: list[ResourceMatch]) -> str:
+
+    def replacement(match: re.Match[str]) -> str:
+        candidates = [item for item in string_args(match.group(1)) if looks_like_image_ref(item)]
+        if not candidates:
+            return match.group(0)
+        resource = None
+        for candidate in candidates:
+            resource = find_resource_for_ref(candidate, resources)
+            if resource is not None:
+                break
+        if resource is None:
+            return match.group(0)
+        local_path = Path(resource.local_path) if resource.local_path else None
+        return replacement_image_html(local_path, urljoin(SOURCE_URL, resource.source), resource.source)
+
+    html = re.sub(r"\bshowpictureq?\s*\((.*?)\)\s*;?", replacement, raw_html, flags=re.IGNORECASE | re.DOTALL)
+    html = re.sub(
+        r"<script\b[^>]*>\s*(<img\b[^>]*>)\s*</script>",
+        lambda match: match.group(1),
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    html = re.sub(
+        r"<script\b[^>]*>\s*document\.write\s*\(\s*(<img\b[^>]*>)\s*\)\s*;?\s*</script>",
+        lambda match: match.group(1),
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return html
+
+
+def replace_img_src_and_backgrounds(raw_html: str, resources: list[ResourceMatch]) -> str:
+    matched_by_source = {normalize_resource_ref(item.source): item for item in resources}
+    matched_by_basename = {resource_basename(item.source): item for item in resources if resource_basename(item.source)}
+
+    def replacement_src(match: re.Match[str]) -> str:
+        src = match.group(2)
+        resource = matched_by_source.get(normalize_resource_ref(src)) or matched_by_basename.get(resource_basename(src))
+        if resource and resource.local_path:
+            return f'{match.group(1)}{image_uri(Path(resource.local_path))}{match.group(3)}'
+        return match.group(0)
+
+    html = re.sub(r"(\bsrc\s*=\s*['\"])([^'\"]+)(['\"])", replacement_src, raw_html, flags=re.IGNORECASE)
+
+    def replacement_bg(match: re.Match[str]) -> str:
+        src = match.group(1).strip().strip("\"'")
+        resource = matched_by_source.get(normalize_resource_ref(src)) or matched_by_basename.get(resource_basename(src))
+        if resource and resource.local_path:
+            return f"url({image_uri(Path(resource.local_path))})"
+        return match.group(0)
+
+    return re.sub(r"url\(([^)]+)\)", replacement_bg, html, flags=re.IGNORECASE)
+
+
+def prepare_render_html(task: dict[str, Any], data_path: Path) -> RenderHtmlResult:
+    raw_html = str(task.get("html") or "")
+    result = RenderHtmlResult(raw_html=raw_html, prepared_html="")
+    if not raw_html.strip():
+        result.errors.append("Source HTML is empty")
+        return result
+
+    expanded = extract_document_write_html(raw_html)
+    resources = extract_render_resources(expanded)
+    match_resources(task, data_path, resources)
+    html = replace_js_image_calls(expanded, resources)
+    html = replace_img_src_and_backgrounds(html, resources)
+    result.resources = resources
+    result.prepared_html = html
+    return result
+
+
+def create_rendered_html_document(task: dict[str, Any], data_path: Path, render_width: int) -> RenderHtmlResult:
+    result = prepare_render_html(task, data_path)
+    task_html = result.prepared_html
+    if not task_html:
+        return result
+    result.prepared_html = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    padding: 24px;
+    background: #ffffff;
+    color: #111827;
+    font-family: Arial, "Helvetica Neue", sans-serif;
+    font-size: 18px;
+    line-height: 1.45;
+  }}
+  .task-card {{
+    width: {render_width}px;
+    background: #ffffff;
+    border: 1px solid #d1d5db;
+    padding: 18px 20px;
+  }}
+  .hint {{
+    margin: 0 0 12px;
+    color: #374151;
+    font-weight: 700;
+  }}
+  table {{
+    border-collapse: collapse;
+    max-width: 100%;
+  }}
+  td {{
+    vertical-align: top;
+  }}
+  p {{
+    margin: 0 0 10px;
+  }}
+  img,
+  .inline-image {{
+    max-width: 100%;
+    height: auto;
+    vertical-align: middle;
+  }}
+  input[type="text"] {{
+    min-height: 26px;
+    border: 1px solid #9ca3af;
+  }}
+  .submit-block {{
+    display: none;
+  }}
+</style>
+</head>
+<body>
+<div class="task-card">
+{task_html}
+</div>
+</body>
+</html>"""
+    return result
+
+
+class HtmlTaskRenderer:
+    def __init__(self, render_width: int, render_scale: float) -> None:
+        self.render_width = render_width
+        self.render_scale = render_scale
+        self.playwright = None
+        self.browser = None
+        self.available = False
+        self.error = ""
+
+    def __enter__(self) -> "HtmlTaskRenderer":
+        try:
+            from playwright.sync_api import sync_playwright
+
+            self.playwright = sync_playwright().start()
+            self.browser = self.playwright.chromium.launch(headless=True)
+            self.available = True
+        except Exception as exc:
+            self.error = str(exc)
+            self.close()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self.browser is not None:
+            self.browser.close()
+            self.browser = None
+        if self.playwright is not None:
+            self.playwright.stop()
+            self.playwright = None
+
+    def render(self, html: str, out_path: Path, result: RenderHtmlResult | None = None) -> Path:
+        if not self.available or self.browser is None:
+            raise RuntimeError(self.error or "Playwright renderer is unavailable")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        page = self.browser.new_page(
+            viewport={"width": self.render_width + 80, "height": 1400},
+            device_scale_factor=self.render_scale,
+        )
+        try:
+            if result is not None:
+                page.on("console", lambda msg: result.console_messages.append(f"{msg.type}: {msg.text}"))
+                page.on("pageerror", lambda exc: result.page_errors.append(str(exc)))
+                page.on("requestfailed", lambda request: result.failed_requests.append(f"{request.url}: {request.failure}"))
+            page.set_content(html, wait_until="load")
+            page.wait_for_load_state("networkidle", timeout=10000)
+            unloaded = page.evaluate(
+                """async () => {
+                    const images = Array.from(document.images);
+                    await Promise.all(images.map(img => {
+                        if (img.complete) return Promise.resolve();
+                        return new Promise(resolve => {
+                            img.addEventListener('load', resolve, { once: true });
+                            img.addEventListener('error', resolve, { once: true });
+                            setTimeout(resolve, 3000);
+                        });
+                    }));
+                    return images
+                        .filter(img => !img.complete || img.naturalWidth === 0)
+                        .map(img => img.currentSrc || img.src || img.alt || '');
+                }"""
+            )
+            if result is not None:
+                result.unloaded_images.extend([str(item) for item in unloaded])
+            page.locator(".task-card").screenshot(path=str(out_path))
+        finally:
+            page.close()
+        return out_path
 
 
 def safe_text(text: Any, stats: ExportStats, qid: str, field: str) -> str:
@@ -401,6 +856,50 @@ def image_size(path: Path) -> tuple[int, int]:
         return image.size
 
 
+def write_render_debug(
+    debug_dir: Path,
+    task: dict[str, Any],
+    sequence: int,
+    render_result: RenderHtmlResult,
+    rendered_path: Path | None,
+) -> None:
+    qid = str(task.get("qid", ""))
+    task_dir = debug_dir / f"{sequence:04d}_{qid}"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / "source.html").write_text(render_result.raw_html, encoding="utf-8")
+    (task_dir / "prepared.html").write_text(render_result.prepared_html, encoding="utf-8")
+    debug_png = None
+    if rendered_path is not None and rendered_path.exists():
+        debug_png = task_dir / "rendered.png"
+        shutil.copy2(rendered_path, debug_png)
+    diagnostics = {
+        "qid": qid,
+        "url": task.get("url"),
+        "line_number": task.get("_line_number"),
+        "html_fields": [key for key, value in task.items() if "html" in str(key).lower() and value],
+        "text_fields": [key for key, value in task.items() if "text" in str(key).lower() and value],
+        "image_fields": [key for key, value in task.items() if "image" in str(key).lower() and value],
+        "found_resources": [item.source for item in render_result.resources],
+        "matched_resources": [
+            {"source": item.source, "local_path": item.local_path, "reason": item.reason}
+            for item in render_result.resources
+            if item.status == "matched"
+        ],
+        "unmatched_resources": [
+            {"source": item.source, "reason": item.reason}
+            for item in render_result.resources
+            if item.status != "matched"
+        ],
+        "console_messages": render_result.console_messages,
+        "page_errors": render_result.page_errors,
+        "failed_requests": render_result.failed_requests,
+        "unloaded_images": render_result.unloaded_images,
+        "errors": render_result.errors,
+        "rendered_png": str(debug_png or rendered_path) if rendered_path else None,
+    }
+    (task_dir / "diagnostics.json").write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def scaled_size(width: int, height: int, max_width: int = MAX_IMAGE_WIDTH_PX) -> tuple[int, int]:
     if width <= max_width:
         return width, height
@@ -414,6 +913,12 @@ def build_tasks_sheet(
     data_path: Path,
     mode: str,
     stats: ExportStats,
+    task_view: str,
+    renderer: HtmlTaskRenderer | None,
+    render_dir: Path,
+    render_width: int,
+    debug_render: bool,
+    render_debug_dir: Path,
 ) -> None:
     iterable = tasks
     if tqdm:
@@ -434,6 +939,66 @@ def build_tasks_sheet(
             ws.cell(row, 1).fill = PatternFill("solid", fgColor="D9EAF7")
             ws.row_dimensions[row].height = 26
             row += 1
+
+            rendered_done = False
+            if task_view == "rendered":
+                render_result = create_rendered_html_document(task, data_path, render_width)
+                html_doc = render_result.prepared_html
+                rendered_path = render_dir / f"{idx:04d}_{qid}.png"
+                stats.render_resources_found += len(render_result.resources)
+                stats.render_resources_matched += render_result.matched_count
+                stats.render_resources_unmatched += render_result.unmatched_count
+                for item in render_result.resources:
+                    if item.status != "matched":
+                        stats.errors.append({"qid": qid, "type": "unmatched_render_resource", "message": item.source})
+                if not html_doc:
+                    stats.rendered_fallbacks += 1
+                    stats.errors.append(
+                        {"qid": qid, "type": "rendered_fallback", "message": "; ".join(render_result.errors) or "Source HTML is empty"}
+                    )
+                elif renderer is None or not renderer.available:
+                    stats.rendered_fallbacks += 1
+                    message = renderer.error if renderer is not None and renderer.error else "Playwright renderer is unavailable"
+                    stats.errors.append({"qid": qid, "type": "rendered_fallback", "message": message})
+                else:
+                    try:
+                        renderer.render(html_doc, rendered_path, render_result)
+                        stats.render_failed_requests += len(render_result.failed_requests)
+                        stats.render_unloaded_images += len(render_result.unloaded_images)
+                        for failed in render_result.failed_requests:
+                            stats.errors.append({"qid": qid, "type": "render_failed_request", "message": failed})
+                        for unloaded in render_result.unloaded_images:
+                            stats.errors.append({"qid": qid, "type": "render_unloaded_image", "message": unloaded})
+                        stats.rendered_png_created += 1
+                        width, height = image_size(rendered_path)
+                        scaled_w, scaled_h = scaled_size(width, height)
+                        if mode == "embedded":
+                            img = XLImage(str(rendered_path))
+                            img.width = scaled_w
+                            img.height = scaled_h
+                            ws.add_image(img, f"B{row}")
+                            ws.row_dimensions[row].height = max(28, scaled_h * 0.75 + 10)
+                            stats.images_embedded += 1
+                        else:
+                            merge_write(ws, row, 1, 10, "Открыть rendered-карточку", "service")
+                            ws.cell(row, 1).hyperlink = rendered_path.resolve().as_uri()
+                            ws.cell(row, 1).style = "Hyperlink"
+                            ws.row_dimensions[row].height = 24
+                            stats.images_linked += 1
+                        row += 1
+                        rendered_done = True
+                    except Exception as exc:
+                        stats.rendered_fallbacks += 1
+                        stats.errors.append({"qid": qid, "type": "rendered_fallback", "message": str(exc)})
+                if debug_render:
+                    write_render_debug(render_debug_dir, task, idx, render_result, rendered_path if rendered_path.exists() else None)
+
+            if rendered_done:
+                apply_card_border(ws, card_start, row - 1)
+                row += 2
+                stats.cards_created += 1
+                stats.tasks_processed += 1
+                continue
 
             merge_write(ws, row, 1, 10, text)
             ws.row_dimensions[row].height = min(260, max(45, math.ceil(len(text) / 95) * 16))
@@ -516,7 +1081,13 @@ def order_sheets(wb: Workbook) -> None:
     wb._sheets.sort(key=lambda ws: desired.index(ws.title) if ws.title in desired else len(desired))
 
 
-def validate_workbook(path: Path, tasks: list[dict[str, Any]], stats: ExportStats, mode: str) -> list[str]:
+def validate_workbook(
+    path: Path,
+    tasks: list[dict[str, Any]],
+    stats: ExportStats,
+    mode: str,
+    task_view: str,
+) -> list[str]:
     issues: list[str] = []
     wb = load_workbook(path, read_only=False)
     try:
@@ -544,8 +1115,13 @@ def validate_workbook(path: Path, tasks: list[dict[str, Any]], stats: ExportStat
             for raw_path in task.get("local_images") or []:
                 if resolve_path(str(raw_path), Path(path).parent / "tasks.jsonl") is None:
                     issues.append(f"Missing local image link: {raw_path}")
-        if mode == "embedded" and stats.images_embedded != stats.accessible_images:
+        if mode == "embedded" and task_view == "structured" and stats.images_embedded != stats.accessible_images:
             issues.append(f"Embedded image mismatch: {stats.images_embedded} != {stats.accessible_images}")
+        if mode == "embedded" and task_view == "rendered" and stats.rendered_png_created + stats.rendered_fallbacks != len(tasks):
+            issues.append(
+                "Rendered task count mismatch: "
+                f"{stats.rendered_png_created} rendered + {stats.rendered_fallbacks} fallback != {len(tasks)}"
+            )
     finally:
         wb.close()
     return issues
@@ -555,21 +1131,53 @@ def build_excel(args: argparse.Namespace) -> ExportStats:
     data_path = Path(args.data)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tasks = load_tasks(data_path, args.limit)
+    qid_filter = parse_qid_filter(args.qid, args.qid_file)
+    tasks = load_tasks(data_path, args.limit, qid_filter)
     total_jsonl_count = read_all_jsonl_count(data_path)
+    render_dir = rendered_dir_from_args(args, data_path)
+    render_debug_dir = render_debug_dir_from_args(args, data_path)
     stats = ExportStats()
 
     wb = Workbook()
     set_common_layout(wb)
     create_summary_sheet(wb, data_path, tasks, total_jsonl_count, args.mode)
     tasks_sheet = setup_tasks_sheet(wb)
-    build_tasks_sheet(tasks_sheet, tasks, data_path, args.mode, stats)
+
+    if args.task_view == "rendered":
+        with HtmlTaskRenderer(args.render_width, args.render_scale) as renderer:
+            build_tasks_sheet(
+                tasks_sheet,
+                tasks,
+                data_path,
+                args.mode,
+                stats,
+                args.task_view,
+                renderer,
+                render_dir,
+                args.render_width,
+                args.debug_render,
+                render_debug_dir,
+            )
+    else:
+        build_tasks_sheet(
+            tasks_sheet,
+            tasks,
+            data_path,
+            args.mode,
+            stats,
+            args.task_view,
+            None,
+            render_dir,
+            args.render_width,
+            args.debug_render,
+            render_debug_dir,
+        )
     create_index_sheet(wb, tasks, data_path, stats)
     create_errors_sheet(wb, stats.errors)
     order_sheets(wb)
     wb.save(out_path)
 
-    issues = validate_workbook(out_path, tasks, stats, args.mode)
+    issues = validate_workbook(out_path, tasks, stats, args.mode, args.task_view)
     for issue in issues:
         stats.errors.append({"qid": "", "type": "workbook_validation", "message": issue})
     if issues:
@@ -594,6 +1202,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data", required=True, help="Path to tasks.jsonl.")
     parser.add_argument("--out", required=True, help="Output .xlsx path.")
     parser.add_argument("--mode", choices=("embedded", "links"), default="links", help="Embed images or link to them.")
+    parser.add_argument(
+        "--task-view",
+        choices=("structured", "rendered"),
+        default="structured",
+        help="Show tasks as editable text blocks or rendered HTML screenshots.",
+    )
+    parser.add_argument("--render-width", type=int, default=900, help="Rendered task card width in pixels.")
+    parser.add_argument("--render-scale", type=float, default=1.0, help="Playwright device scale factor for screenshots.")
+    parser.add_argument("--render-dir", default=None, help="Directory for rendered task PNG files.")
+    parser.add_argument("--debug-render", action="store_true", help="Save rendered HTML/PNG diagnostics per task.")
+    parser.add_argument("--render-debug-dir", default=None, help="Directory for rendered diagnostics.")
+    parser.add_argument("--qid", default=None, help="Comma-separated qid filter.")
+    parser.add_argument("--qid-file", default=None, help="Text file with one qid per line.")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of tasks for preview.")
     return parser
 
@@ -608,6 +1229,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  cards created: {stats.cards_created}")
     print(f"  images embedded: {stats.images_embedded}")
     print(f"  images linked: {stats.images_linked}")
+    print(f"  rendered png created: {stats.rendered_png_created}")
+    print(f"  rendered fallbacks: {stats.rendered_fallbacks}")
+    print(f"  render resources found: {stats.render_resources_found}")
+    print(f"  render resources matched: {stats.render_resources_matched}")
+    print(f"  render resources unmatched: {stats.render_resources_unmatched}")
+    print(f"  render failed requests: {stats.render_failed_requests}")
+    print(f"  render unloaded images: {stats.render_unloaded_images}")
     print(f"  images skipped: {stats.images_skipped}")
     print(f"  errors: {len(stats.errors)}")
     print(f"  xlsx size: {size_mb:.2f} MB")

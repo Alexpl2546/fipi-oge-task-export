@@ -116,6 +116,31 @@ py -m src.export_excel --data data_full/tasks.jsonl --out data_full/fipi_oge_mat
 
 Embedded-файл может быть тяжёлым и открываться медленнее, потому что изображения физически встраиваются в workbook. Links-версия компактнее: она сохраняет карточки заданий и кликабельные локальные ссылки на изображения.
 
+В Excel создаются листы `Общая информация`, `Перечень заданий`, `Задания` и, только при ошибках обработки, `Ошибки`. На листе `Перечень заданий` есть содержательные колонки `Тип задания` и `Тема`: они берутся из исходных данных, если такие поля заполнены, иначе определяются воспроизводимой локальной эвристикой по тексту задания. Лист `Задания` очищен от технических полей и предназначен для чтения заданий как учебного сборника: заголовок карточки ведёт на источник ФИПИ, ниже идут текст, варианты ответа и связанные изображения или ссылки на них.
+
+У листа `Задания` есть два режима отображения:
+
+- `--task-view structured` — редактируемый текст задания, варианты ответа и изображения отдельными блоками.
+- `--task-view rendered` — HTML задания рендерится в PNG через Playwright и визуально ближе к сайту ФИПИ: inline-формулы, таблицы и картинки остаются на своих местах. В режиме `--mode embedded` PNG-карточки вставляются в Excel; rendered-файл может быть тяжёлым. В режиме `--mode links` создаются ссылки на локальные rendered PNG.
+
+Для rendered-режима после установки зависимостей может потребоваться установить Chromium для Playwright:
+
+```powershell
+py -m playwright install chromium
+```
+
+Preview rendered:
+
+```powershell
+py -m src.export_excel --data data_full/tasks.jsonl --out data_full/fipi_oge_math_preview_rendered.xlsx --mode embedded --task-view rendered --limit 20
+```
+
+Полная rendered-версия:
+
+```powershell
+py -m src.export_excel --data data_full/tasks.jsonl --out data_full/fipi_oge_math_full_rendered.xlsx --mode embedded --task-view rendered
+```
+
 ## Site Analysis
 
 Стартовая страница проекта:

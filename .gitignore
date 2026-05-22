@@ -2,6 +2,10 @@ data/*
 !data/.gitkeep
 data_test/
 data_full/
+data_full/rendered_tasks/
+data_full/render_debug/
+rendered_tasks/
+render_debug/
 data_tls_test/
 data_tls_check/
 *.xlsx
