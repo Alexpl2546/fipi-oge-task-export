@@ -5,7 +5,6 @@ import csv
 import json
 import math
 import sqlite3
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +24,10 @@ except ImportError:  # pragma: no cover
 
 SOURCE_URL = "https://oge.fipi.ru/bank/index.php?proj=DE0E276E497AB3784C3FC4CC20248DC0"
 TITLE = "ФИПИ ОГЭ Математика — полный экспорт заданий"
+SUMMARY_SHEET = "Общая информация"
+INDEX_SHEET = "Перечень заданий"
+TASKS_SHEET = "Задания"
+ERRORS_SHEET = "Ошибки"
 MAX_IMAGE_WIDTH_PX = 680
 MAX_CELL_TEXT = 32000
 
@@ -104,15 +107,6 @@ def resolve_path(raw_path: str, data_path: Path) -> Path | None:
     return None
 
 
-def markdown_path_for(task: dict[str, Any], data_path: Path) -> Path:
-    return data_path.parent / "markdown" / f"{task.get('qid')}.md"
-
-
-def make_short_text(text: str, limit: int = 280) -> str:
-    text = " ".join(str(text or "").split())
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
-
-
 def safe_text(text: Any, stats: ExportStats, qid: str, field: str) -> str:
     value = "" if text is None else str(text)
     if len(value) > MAX_CELL_TEXT:
@@ -133,6 +127,138 @@ def options_text(options: list[dict[str, Any]]) -> str:
         else:
             lines.append(text or value)
     return "\n".join(lines)
+
+
+def normalized_text(value: Any) -> str:
+    return " ".join(str(value or "").lower().replace("ё", "е").split())
+
+
+def has_answer_options(task: dict[str, Any]) -> bool:
+    for key in ("options", "choices", "answers"):
+        value = task.get(key)
+        if isinstance(value, list) and len(value) > 0:
+            return True
+    return False
+
+
+def infer_task_type(task: dict[str, Any]) -> str:
+    text = normalized_text(task.get("text", ""))
+    if has_answer_options(task):
+        return "Выбор варианта ответа"
+    if any(
+        phrase in text
+        for phrase in (
+            "впишите правильный ответ",
+            "запишите ответ",
+            "в ответе укажите",
+            "ответ:",
+            "найдите",
+            "вычислите",
+        )
+    ):
+        return "Краткий ответ"
+    if any(
+        phrase in text
+        for phrase in (
+            "укажите номера",
+            "выберите все",
+            "выберите верные",
+            "какие из следующих",
+            "несколько вариантов",
+            "все верные утверждения",
+            "верные утверждения",
+        )
+    ):
+        return "Выбор нескольких ответов"
+    if any(
+        phrase in text
+        for phrase in (
+            "установите соответствие",
+            "соотнесите",
+            "каждому элементу",
+            "подберите",
+        )
+    ):
+        return "Установление соответствия"
+    if any(phrase in text for phrase in ("расположите", "в правильном порядке", "последовательность")):
+        return "Установление последовательности"
+    return "Не определено"
+
+
+def flatten_topic_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        parts = [flatten_topic_value(item) for item in value]
+        return "; ".join(part for part in parts if part)
+    if isinstance(value, dict):
+        preferred = []
+        for key in ("topic", "section", "theme", "subject", "block", "category", "kesh", "кэс", "breadcrumbs", "path"):
+            item = flatten_topic_value(value.get(key))
+            if item:
+                preferred.append(item)
+        if preferred:
+            return "; ".join(dict.fromkeys(preferred))
+    return ""
+
+
+def explicit_topic(task: dict[str, Any]) -> str:
+    for key in (
+        "topic",
+        "section",
+        "theme",
+        "subject",
+        "block",
+        "category",
+        "kesh",
+        "кэс",
+        "kes",
+        "metadata",
+        "breadcrumbs",
+        "path",
+        "source section",
+        "source_section",
+    ):
+        value = flatten_topic_value(task.get(key))
+        if value:
+            return value
+    return ""
+
+
+def contains_any(text: str, phrases: tuple[str, ...]) -> bool:
+    return any(phrase in text for phrase in phrases)
+
+
+def infer_math_topic(task: dict[str, Any]) -> str:
+    value = explicit_topic(task)
+    if value:
+        return value
+
+    text = normalized_text(task.get("text", ""))
+    topic_rules = [
+        ("Вероятность и статистика", ("вероятность", "случайный опыт", "элементарные события", "благоприятствуют событию", "среднее арифметическое", "медиана", "мода", "диаграмма", "таблица частот")),
+        ("Функции и графики", ("график функции", "функция", "координатная плоскость", "парабола", "прямая", "гипербола", "значение функции", "область определения")),
+        ("Уравнения и неравенства", ("система уравнений", "система неравенств", "решите уравнение", "корень уравнения", "неравенство")),
+        ("Последовательности и прогрессии", ("арифметическая прогрессия", "геометрическая прогрессия", "последовательность", "n-й член", "сумма первых членов")),
+        ("Геометрия: площади", ("площадь фигуры", "площадь треугольника", "площадь круга", "площадь трапеции", "площадь параллелограмма", "площадь")),
+        ("Геометрия: окружность и круг", ("окружность", "круг", "радиус", "диаметр", "хорда", "дуга", "касательная", "центральный угол", "вписанный угол")),
+        ("Геометрия: треугольники", ("подобные треугольники", "треугольник", "катет", "гипотенуза", "медиана", "биссектриса", "высота")),
+        ("Геометрия: четырёхугольники и многоугольники", ("параллелограмм", "ромб", "трапеция", "прямоугольник", "квадрат", "многоугольник")),
+        ("Геометрия: стереометрия", ("объем", "поверхность", "призма", "пирамида", "цилиндр", "конус", "шар", "куб", "параллелепипед")),
+        ("Практико-ориентированные задачи", ("участок", "план", "квартира", "тариф", "квитанция", "печь", "дорога", "карта", "масштаб", "плитка", "теплица", "забор", "ремонт")),
+        ("Текстовые задачи", ("поезд", "автомобиль", "скорость", "время", "расстояние", "работа", "производительность", "смесь", "сплав", "вклад", "цена", "стоимость", "покупка", "проценты по вкладу")),
+        ("Комбинаторика", ("сколько способов", "варианты", "комбинации", "перестановки", "выбор", "код", "пароль")),
+        ("Алгебраические выражения", ("упростите выражение", "преобразуйте выражение", "многочлен", "одночлен", "разложите на множители", "тождество")),
+        ("Арифметика и вычисления", ("вычислите", "значение выражения", "дробь", "процент", "отношение", "пропорция", "округление", "степень", "корень")),
+    ]
+    for topic, phrases in topic_rules:
+        if contains_any(text, phrases):
+            return topic
+    return "Не определено"
 
 
 def set_common_layout(wb: Workbook) -> None:
@@ -158,27 +284,18 @@ def create_summary_sheet(
     mode: str,
 ) -> None:
     ws = wb.active
-    ws.title = "Summary"
+    ws.title = SUMMARY_SHEET
     ws.sheet_view.showGridLines = False
     ws.column_dimensions["A"].width = 34
     ws.column_dimensions["B"].width = 90
 
-    root = data_path.parent
     values = [
-        ("Название выгрузки", TITLE),
-        ("Исходный URL", SOURCE_URL),
+        ("Название набора данных", TITLE),
+        ("Источник", SOURCE_URL),
         ("Дата формирования Excel", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        ("Режим Excel", mode),
-        ("Количество заданий в Excel", len(tasks)),
-        ("Количество изображений в Excel JSONL slice", sum(len(t.get("local_images") or []) for t in tasks)),
-        ("Количество записей JSONL", total_jsonl_count),
-        ("Количество записей CSV", count_csv(root / "tasks.csv")),
-        ("Количество записей SQLite", count_sqlite(root / "tasks.sqlite")),
-        ("Статус последней валидации", parse_validation_status(root / "export_report.md")),
-        (
-            "Правильные ответы",
-            "Открытый HTML ФИПИ не выдаёт правильные ответы для выгруженных заданий; пустое поле answer сохраняется как null.",
-        ),
+        ("Количество заданий", len(tasks)),
+        ("Количество изображений", sum(len(t.get("local_images") or []) for t in tasks)),
+        ("Статус последней валидации", parse_validation_status(data_path.parent / "export_report.md")),
         ("Примечание о правах", "Права на задания и материалы сохраняются за ФИПИ/правообладателями."),
     ]
     ws["A1"] = "Параметр"
@@ -193,66 +310,57 @@ def create_summary_sheet(
     ws.freeze_panes = "A2"
 
 
-def create_index_sheet(wb: Workbook, tasks: list[dict[str, Any]], data_path: Path) -> None:
-    ws = wb.create_sheet("Index")
+def create_index_sheet(wb: Workbook, tasks: list[dict[str, Any]], data_path: Path, stats: ExportStats) -> None:
+    ws = wb.create_sheet(INDEX_SHEET)
     headers = [
         "№",
-        "qid",
+        "Номер задания",
         "URL",
-        "КЭС / раздел",
+        "Тип задания",
         "Тема",
-        "Номер",
-        "Краткий текст",
-        "Изображений",
-        "Карточка",
-        "Markdown",
+        "Текст задания",
+        "Ссылка на карточку",
     ]
     ws.append(headers)
     style_header(ws[1])
-    widths = [8, 14, 36, 42, 22, 14, 70, 12, 18, 36]
+    widths = [8, 18, 42, 28, 34, 90, 22]
     for idx, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = width
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:J{len(tasks) + 1}"
+    ws.auto_filter.ref = f"A1:G{len(tasks) + 1}"
 
     for row_idx, task in enumerate(tasks, start=2):
         task_no = row_idx - 1
         qid = str(task.get("qid", ""))
-        markdown_path = markdown_path_for(task, data_path)
-        kes = "; ".join(task.get("kes") or [])
+        task_type = infer_task_type(task)
+        topic = infer_math_topic(task)
+        full_text = safe_text(task.get("text", ""), stats, qid, "index_text")
         values = [
             task_no,
-            qid,
+            task.get("task_number") or task_no,
             task.get("url", ""),
-            kes,
-            task.get("theme") or "",
-            task.get("task_number") or qid,
-            make_short_text(task.get("text", "")),
-            len(task.get("local_images") or []),
+            task_type,
+            topic,
+            full_text,
             "Открыть карточку",
-            str(markdown_path),
         ]
         ws.append(values)
         excel_row = row_idx
         task_anchor = task.get("_excel_task_row")
         if task_anchor:
-            ws.cell(excel_row, 9).hyperlink = f"#{quote_sheetname('Tasks')}!A{task_anchor}"
-            ws.cell(excel_row, 9).style = "Hyperlink"
-        ws.cell(excel_row, 2).hyperlink = task.get("url", "")
-        ws.cell(excel_row, 2).style = "Hyperlink"
+            ws.cell(excel_row, 7).hyperlink = f"#{quote_sheetname(TASKS_SHEET)}!A{task_anchor}"
+            ws.cell(excel_row, 7).style = "Hyperlink"
         ws.cell(excel_row, 3).hyperlink = task.get("url", "")
         ws.cell(excel_row, 3).style = "Hyperlink"
-        if markdown_path.exists():
-            ws.cell(excel_row, 10).hyperlink = markdown_path.resolve().as_uri()
-            ws.cell(excel_row, 10).style = "Hyperlink"
         for cell in ws[excel_row]:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
     for row in ws.iter_rows(min_row=2, max_row=len(tasks) + 1):
-        ws.row_dimensions[row[0].row].height = 45
+        text = str(ws.cell(row[0].row, 6).value or "")
+        ws.row_dimensions[row[0].row].height = min(120, max(34, math.ceil(len(text) / 95) * 15))
 
 
 def setup_tasks_sheet(wb: Workbook) -> Any:
-    ws = wb.create_sheet("Tasks")
+    ws = wb.create_sheet(TASKS_SHEET)
     widths = [6, 14, 18, 18, 18, 18, 18, 18, 18, 18]
     for idx, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = width
@@ -353,7 +461,7 @@ def build_tasks_sheet(
                     continue
                 stats.accessible_images += 1
                 if mode == "links":
-                    merge_write(ws, row, 1, 10, f"Изображение {img_idx}: {image_path}", "service")
+                    merge_write(ws, row, 1, 10, f"Открыть изображение {img_idx}", "service")
                     ws.cell(row, 1).hyperlink = image_path.as_uri()
                     ws.cell(row, 1).style = "Hyperlink"
                     ws.row_dimensions[row].height = 22
@@ -376,18 +484,6 @@ def build_tasks_sheet(
                     merge_write(ws, row, 1, 10, f"Не удалось встроить изображение: {image_path}", "service")
                     row += 1
 
-            markdown_path = markdown_path_for(task, data_path)
-            service = (
-                f"qid: {qid}\n"
-                f"URL: {task.get('url', '')}\n"
-                f"Локальные изображения: {json.dumps(local_images, ensure_ascii=False)}\n"
-                f"Markdown: {markdown_path}"
-            )
-            service = safe_text(service, stats, qid, "service")
-            merge_write(ws, row, 1, 10, service, "service")
-            ws.row_dimensions[row].height = min(120, max(45, math.ceil(len(service) / 110) * 14))
-            row += 1
-
             apply_card_border(ws, card_start, row - 1)
             row += 2
             stats.cards_created += 1
@@ -400,7 +496,7 @@ def build_tasks_sheet(
 def create_errors_sheet(wb: Workbook, errors: list[dict[str, str]]) -> None:
     if not errors:
         return
-    ws = wb.create_sheet("Errors")
+    ws = wb.create_sheet(ERRORS_SHEET)
     ws.append(["qid", "type", "message"])
     style_header(ws[1])
     ws.column_dimensions["A"].width = 14
@@ -416,7 +512,7 @@ def create_errors_sheet(wb: Workbook, errors: list[dict[str, str]]) -> None:
 
 
 def order_sheets(wb: Workbook) -> None:
-    desired = ["Summary", "Index", "Tasks", "Errors"]
+    desired = [SUMMARY_SHEET, INDEX_SHEET, TASKS_SHEET, ERRORS_SHEET]
     wb._sheets.sort(key=lambda ws: desired.index(ws.title) if ws.title in desired else len(desired))
 
 
@@ -424,13 +520,17 @@ def validate_workbook(path: Path, tasks: list[dict[str, Any]], stats: ExportStat
     issues: list[str] = []
     wb = load_workbook(path, read_only=False)
     try:
-        index = wb["Index"]
-        tasks_sheet = wb["Tasks"]
-        index_qids = [index.cell(row=i, column=2).value for i in range(2, index.max_row + 1)]
-        if len(index_qids) != len(tasks):
-            issues.append(f"Index qid count mismatch: {len(index_qids)} != {len(tasks)}")
-        if len(set(index_qids)) != len(index_qids):
-            issues.append("Duplicate qids found in Index sheet")
+        expected_sheets = [SUMMARY_SHEET, INDEX_SHEET, TASKS_SHEET]
+        if wb.sheetnames[:3] != expected_sheets:
+            issues.append(f"Sheet order mismatch: {wb.sheetnames[:3]} != {expected_sheets}")
+        index = wb[INDEX_SHEET]
+        tasks_sheet = wb[TASKS_SHEET]
+        index_rows = max(0, index.max_row - 1)
+        if index_rows != len(tasks):
+            issues.append(f"Index row count mismatch: {index_rows} != {len(tasks)}")
+        qids = [str(task.get("qid", "")) for task in tasks]
+        if len(set(qids)) != len(qids):
+            issues.append("Duplicate qids found in source tasks")
         card_count = 0
         for row in range(1, tasks_sheet.max_row + 1):
             cell = tasks_sheet.cell(row=row, column=1)
@@ -464,7 +564,7 @@ def build_excel(args: argparse.Namespace) -> ExportStats:
     create_summary_sheet(wb, data_path, tasks, total_jsonl_count, args.mode)
     tasks_sheet = setup_tasks_sheet(wb)
     build_tasks_sheet(tasks_sheet, tasks, data_path, args.mode, stats)
-    create_index_sheet(wb, tasks, data_path)
+    create_index_sheet(wb, tasks, data_path, stats)
     create_errors_sheet(wb, stats.errors)
     order_sheets(wb)
     wb.save(out_path)
@@ -475,10 +575,10 @@ def build_excel(args: argparse.Namespace) -> ExportStats:
     if issues:
         # Persist validation issues to the workbook after initial save.
         wb = load_workbook(out_path)
-        if "Errors" in wb.sheetnames:
-            ws = wb["Errors"]
+        if ERRORS_SHEET in wb.sheetnames:
+            ws = wb[ERRORS_SHEET]
         else:
-            ws = wb.create_sheet("Errors")
+            ws = wb.create_sheet(ERRORS_SHEET)
             ws.append(["qid", "type", "message"])
             style_header(ws[1])
         for issue in issues:
