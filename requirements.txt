@@ -1,0 +1,7 @@
+requests>=2.31
+certifi>=2024.2.2
+truststore>=0.10.0
+lxml>=5.0
+tqdm>=4.66
+openpyxl>=3.1
+Pillow>=10.0

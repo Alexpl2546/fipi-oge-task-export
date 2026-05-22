@@ -1,0 +1,17 @@
+data/*
+!data/.gitkeep
+data_test/
+data_full/
+data_tls_test/
+data_tls_check/
+*.xlsx
+*.zip
+logs/*
+!logs/.gitkeep
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+logs/
