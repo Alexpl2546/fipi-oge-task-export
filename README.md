@@ -121,7 +121,7 @@ Embedded-файл может быть тяжёлым и открываться �
 У листа `Задания` есть два режима отображения:
 
 - `--task-view structured` — редактируемый текст задания, варианты ответа и изображения отдельными блоками.
-- `--task-view rendered` — HTML задания рендерится в PNG через Playwright и визуально ближе к сайту ФИПИ: inline-формулы, таблицы и картинки остаются на своих местах. В режиме `--mode embedded` PNG-карточки вставляются в Excel; rendered-файл может быть тяжёлым. В режиме `--mode links` создаются ссылки на локальные rendered PNG.
+- `--task-view rendered` — HTML задания рендерится в PNG через Playwright и визуально ближе к сайту ФИПИ: inline-формулы, таблицы и картинки остаются на своих местах. Rendered v2 восстанавливает inline-ресурсы из `<img>`, `ShowPicture/ShowPictureQ`, `document.write(...)` и CSS `background-image`, заменяет локальные картинки на `data:image/...` и пишет несопоставленные ресурсы в диагностику/лист `Ошибки`. В режиме `--mode embedded` PNG-карточки вставляются в Excel; rendered-файл может быть тяжёлым. В режиме `--mode links` создаются ссылки на локальные rendered PNG.
 
 Для rendered-режима после установки зависимостей может потребоваться установить Chromium для Playwright:
 
@@ -135,10 +135,28 @@ Preview rendered:
 py -m src.export_excel --data data_full/tasks.jsonl --out data_full/fipi_oge_math_preview_rendered.xlsx --mode embedded --task-view rendered --limit 20
 ```
 
-Полная rendered-версия:
+Problem preview rendered v2 с диагностикой:
 
 ```powershell
-py -m src.export_excel --data data_full/tasks.jsonl --out data_full/fipi_oge_math_full_rendered.xlsx --mode embedded --task-view rendered
+py -m src.export_excel --data data_full/tasks.jsonl --out data_full/fipi_oge_math_problem_preview_rendered.xlsx --mode embedded --task-view rendered --qid 037FEF,453B45,FADB4B,F2AF4A,41D84A,FE3D40 --debug-render
+```
+
+Диагностика rendered-режима сохраняется в `data_full/render_debug/`: исходный HTML, итоговый HTML для Playwright, PNG, найденные/сопоставленные/несопоставленные ресурсы, ошибки консоли, failed requests и изображения с `naturalWidth = 0`.
+
+Полная rendered v2-версия:
+
+```powershell
+py -m src.export_excel --data data_full/tasks.jsonl --out data_full/fipi_oge_math_full_rendered_v2.xlsx --mode embedded --task-view rendered
+```
+
+Если полный рендер упирается в лимит времени, сначала создайте PNG-кэш батчами, затем соберите workbook из готового кэша:
+
+```powershell
+py -m src.export_excel --data data_full/tasks.jsonl --task-view rendered --render-cache-only --offset 0 --limit 1000 --reuse-rendered
+py -m src.export_excel --data data_full/tasks.jsonl --task-view rendered --render-cache-only --offset 1000 --limit 1000 --reuse-rendered
+py -m src.export_excel --data data_full/tasks.jsonl --task-view rendered --render-cache-only --offset 2000 --limit 1000 --reuse-rendered
+py -m src.export_excel --data data_full/tasks.jsonl --task-view rendered --render-cache-only --offset 3000 --limit 884 --reuse-rendered
+py -m src.export_excel --data data_full/tasks.jsonl --out data_full/fipi_oge_math_full_rendered_v2.xlsx --mode embedded --task-view rendered --reuse-rendered
 ```
 
 ## Site Analysis

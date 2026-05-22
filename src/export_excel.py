@@ -99,7 +99,12 @@ def parse_qid_filter(raw_qids: str | None, qid_file: str | None) -> set[str] | N
     return set(qids) if qids else None
 
 
-def load_tasks(path: Path, limit: int | None, qid_filter: set[str] | None = None) -> list[dict[str, Any]]:
+def load_tasks(
+    path: Path,
+    limit: int | None,
+    qid_filter: set[str] | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
     tasks: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as file:
         for line_number, line in enumerate(file, start=1):
@@ -108,7 +113,11 @@ def load_tasks(path: Path, limit: int | None, qid_filter: set[str] | None = None
             task = json.loads(line)
             if qid_filter is not None and str(task.get("qid", "")) not in qid_filter:
                 continue
+            if offset > 0:
+                offset -= 1
+                continue
             task["_line_number"] = line_number
+            task["_global_index"] = line_number
             tasks.append(task)
             if limit and len(tasks) >= limit:
                 break
@@ -907,6 +916,25 @@ def scaled_size(width: int, height: int, max_width: int = MAX_IMAGE_WIDTH_PX) ->
     return int(width * scale), int(height * scale)
 
 
+def insert_rendered_card(ws, row: int, rendered_path: Path, mode: str, stats: ExportStats) -> int:
+    width, height = image_size(rendered_path)
+    scaled_w, scaled_h = scaled_size(width, height)
+    if mode == "embedded":
+        img = XLImage(str(rendered_path))
+        img.width = scaled_w
+        img.height = scaled_h
+        ws.add_image(img, f"B{row}")
+        ws.row_dimensions[row].height = max(28, scaled_h * 0.75 + 10)
+        stats.images_embedded += 1
+    else:
+        merge_write(ws, row, 1, 10, "Открыть rendered-карточку", "service")
+        ws.cell(row, 1).hyperlink = rendered_path.resolve().as_uri()
+        ws.cell(row, 1).style = "Hyperlink"
+        ws.row_dimensions[row].height = 24
+        stats.images_linked += 1
+    return row + 1
+
+
 def build_tasks_sheet(
     ws,
     tasks: list[dict[str, Any]],
@@ -919,6 +947,7 @@ def build_tasks_sheet(
     render_width: int,
     debug_render: bool,
     render_debug_dir: Path,
+    reuse_rendered: bool,
 ) -> None:
     iterable = tasks
     if tqdm:
@@ -944,7 +973,8 @@ def build_tasks_sheet(
             if task_view == "rendered":
                 render_result = create_rendered_html_document(task, data_path, render_width)
                 html_doc = render_result.prepared_html
-                rendered_path = render_dir / f"{idx:04d}_{qid}.png"
+                render_sequence = int(task.get("_global_index") or idx)
+                rendered_path = render_dir / f"{render_sequence:04d}_{qid}.png"
                 stats.render_resources_found += len(render_result.resources)
                 stats.render_resources_matched += render_result.matched_count
                 stats.render_resources_unmatched += render_result.unmatched_count
@@ -956,6 +986,14 @@ def build_tasks_sheet(
                     stats.errors.append(
                         {"qid": qid, "type": "rendered_fallback", "message": "; ".join(render_result.errors) or "Source HTML is empty"}
                     )
+                elif reuse_rendered and rendered_path.exists():
+                    try:
+                        stats.rendered_png_created += 1
+                        row = insert_rendered_card(ws, row, rendered_path, mode, stats)
+                        rendered_done = True
+                    except Exception as exc:
+                        stats.rendered_fallbacks += 1
+                        stats.errors.append({"qid": qid, "type": "rendered_fallback", "message": f"cached PNG failed: {exc}"})
                 elif renderer is None or not renderer.available:
                     stats.rendered_fallbacks += 1
                     message = renderer.error if renderer is not None and renderer.error else "Playwright renderer is unavailable"
@@ -970,22 +1008,7 @@ def build_tasks_sheet(
                         for unloaded in render_result.unloaded_images:
                             stats.errors.append({"qid": qid, "type": "render_unloaded_image", "message": unloaded})
                         stats.rendered_png_created += 1
-                        width, height = image_size(rendered_path)
-                        scaled_w, scaled_h = scaled_size(width, height)
-                        if mode == "embedded":
-                            img = XLImage(str(rendered_path))
-                            img.width = scaled_w
-                            img.height = scaled_h
-                            ws.add_image(img, f"B{row}")
-                            ws.row_dimensions[row].height = max(28, scaled_h * 0.75 + 10)
-                            stats.images_embedded += 1
-                        else:
-                            merge_write(ws, row, 1, 10, "Открыть rendered-карточку", "service")
-                            ws.cell(row, 1).hyperlink = rendered_path.resolve().as_uri()
-                            ws.cell(row, 1).style = "Hyperlink"
-                            ws.row_dimensions[row].height = 24
-                            stats.images_linked += 1
-                        row += 1
+                        row = insert_rendered_card(ws, row, rendered_path, mode, stats)
                         rendered_done = True
                     except Exception as exc:
                         stats.rendered_fallbacks += 1
@@ -1127,12 +1150,71 @@ def validate_workbook(
     return issues
 
 
+def render_png_cache(args: argparse.Namespace) -> ExportStats:
+    data_path = Path(args.data)
+    qid_filter = parse_qid_filter(args.qid, args.qid_file)
+    tasks = load_tasks(data_path, args.limit, qid_filter, args.offset)
+    render_dir = rendered_dir_from_args(args, data_path)
+    render_debug_dir = render_debug_dir_from_args(args, data_path)
+    stats = ExportStats()
+
+    iterable = tasks
+    if tqdm:
+        iterable = tqdm(tasks, desc="Render cache", unit="task")
+    with HtmlTaskRenderer(args.render_width, args.render_scale) as renderer:
+        for idx, task in enumerate(iterable, start=1):
+            qid = str(task.get("qid", ""))
+            stats.tasks_processed += 1
+            render_result = create_rendered_html_document(task, data_path, args.render_width)
+            html_doc = render_result.prepared_html
+            render_sequence = int(task.get("_global_index") or idx)
+            rendered_path = render_dir / f"{render_sequence:04d}_{qid}.png"
+            stats.render_resources_found += len(render_result.resources)
+            stats.render_resources_matched += render_result.matched_count
+            stats.render_resources_unmatched += render_result.unmatched_count
+            for item in render_result.resources:
+                if item.status != "matched":
+                    stats.errors.append({"qid": qid, "type": "unmatched_render_resource", "message": item.source})
+            if not html_doc:
+                stats.rendered_fallbacks += 1
+                stats.errors.append(
+                    {"qid": qid, "type": "rendered_fallback", "message": "; ".join(render_result.errors) or "Source HTML is empty"}
+                )
+            elif args.reuse_rendered and rendered_path.exists():
+                stats.rendered_png_created += 1
+                stats.cards_created += 1
+            elif not renderer.available:
+                stats.rendered_fallbacks += 1
+                stats.errors.append({"qid": qid, "type": "rendered_fallback", "message": renderer.error or "Playwright renderer is unavailable"})
+            else:
+                try:
+                    renderer.render(html_doc, rendered_path, render_result)
+                    stats.render_failed_requests += len(render_result.failed_requests)
+                    stats.render_unloaded_images += len(render_result.unloaded_images)
+                    for failed in render_result.failed_requests:
+                        stats.errors.append({"qid": qid, "type": "render_failed_request", "message": failed})
+                    for unloaded in render_result.unloaded_images:
+                        stats.errors.append({"qid": qid, "type": "render_unloaded_image", "message": unloaded})
+                    stats.rendered_png_created += 1
+                    stats.cards_created += 1
+                except Exception as exc:
+                    stats.rendered_fallbacks += 1
+                    stats.errors.append({"qid": qid, "type": "rendered_fallback", "message": str(exc)})
+            if args.debug_render:
+                write_render_debug(render_debug_dir, task, render_sequence, render_result, rendered_path if rendered_path.exists() else None)
+    return stats
+
+
 def build_excel(args: argparse.Namespace) -> ExportStats:
     data_path = Path(args.data)
+    if args.render_cache_only:
+        return render_png_cache(args)
+    if not args.out:
+        raise ValueError("--out is required unless --render-cache-only is used")
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     qid_filter = parse_qid_filter(args.qid, args.qid_file)
-    tasks = load_tasks(data_path, args.limit, qid_filter)
+    tasks = load_tasks(data_path, args.limit, qid_filter, args.offset)
     total_jsonl_count = read_all_jsonl_count(data_path)
     render_dir = rendered_dir_from_args(args, data_path)
     render_debug_dir = render_debug_dir_from_args(args, data_path)
@@ -1157,6 +1239,7 @@ def build_excel(args: argparse.Namespace) -> ExportStats:
                 args.render_width,
                 args.debug_render,
                 render_debug_dir,
+                args.reuse_rendered,
             )
     else:
         build_tasks_sheet(
@@ -1171,6 +1254,7 @@ def build_excel(args: argparse.Namespace) -> ExportStats:
             args.render_width,
             args.debug_render,
             render_debug_dir,
+            args.reuse_rendered,
         )
     create_index_sheet(wb, tasks, data_path, stats)
     create_errors_sheet(wb, stats.errors)
@@ -1200,7 +1284,7 @@ def build_excel(args: argparse.Namespace) -> ExportStats:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Create formatted Excel workbooks from FIPI JSONL export.")
     parser.add_argument("--data", required=True, help="Path to tasks.jsonl.")
-    parser.add_argument("--out", required=True, help="Output .xlsx path.")
+    parser.add_argument("--out", default=None, help="Output .xlsx path.")
     parser.add_argument("--mode", choices=("embedded", "links"), default="links", help="Embed images or link to them.")
     parser.add_argument(
         "--task-view",
@@ -1211,10 +1295,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--render-width", type=int, default=900, help="Rendered task card width in pixels.")
     parser.add_argument("--render-scale", type=float, default=1.0, help="Playwright device scale factor for screenshots.")
     parser.add_argument("--render-dir", default=None, help="Directory for rendered task PNG files.")
+    parser.add_argument("--render-cache-only", action="store_true", help="Render PNG cache only; do not create an XLSX workbook.")
+    parser.add_argument("--reuse-rendered", action="store_true", help="Reuse existing rendered PNG files from --render-dir.")
     parser.add_argument("--debug-render", action="store_true", help="Save rendered HTML/PNG diagnostics per task.")
     parser.add_argument("--render-debug-dir", default=None, help="Directory for rendered diagnostics.")
     parser.add_argument("--qid", default=None, help="Comma-separated qid filter.")
     parser.add_argument("--qid-file", default=None, help="Text file with one qid per line.")
+    parser.add_argument("--offset", type=int, default=0, help="Skip this many selected tasks before processing.")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of tasks for preview.")
     return parser
 
@@ -1222,8 +1309,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     stats = build_excel(args)
-    out_path = Path(args.out)
-    size_mb = out_path.stat().st_size / (1024 * 1024) if out_path.exists() else 0
+    out_path = Path(args.out) if args.out else None
+    size_mb = out_path.stat().st_size / (1024 * 1024) if out_path and out_path.exists() else 0
     print("Excel export report")
     print(f"  tasks processed: {stats.tasks_processed}")
     print(f"  cards created: {stats.cards_created}")
@@ -1238,8 +1325,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  render unloaded images: {stats.render_unloaded_images}")
     print(f"  images skipped: {stats.images_skipped}")
     print(f"  errors: {len(stats.errors)}")
-    print(f"  xlsx size: {size_mb:.2f} MB")
-    if args.mode == "embedded" and size_mb > 200:
+    if out_path:
+        print(f"  xlsx size: {size_mb:.2f} MB")
+    else:
+        print("  xlsx size: n/a (render cache only)")
+    if out_path and args.mode == "embedded" and size_mb > 200:
         print("  warning: embedded workbook is large and may open slowly")
     return 0 if not stats.errors else 1
 
